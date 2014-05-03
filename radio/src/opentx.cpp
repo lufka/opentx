@@ -1346,9 +1346,6 @@ getvalue_t getValue(uint8_t i)
   #define GETSWITCH_RECURSIVE_TYPE uint16_t
 #endif
 
-volatile GETSWITCH_RECURSIVE_TYPE s_last_switch_used = 0;
-volatile GETSWITCH_RECURSIVE_TYPE s_last_switch_value = 0;
-
 #if defined(CPUARM)
 uint32_t cswDelays[NUM_LOGICAL_SWITCH];
 uint32_t cswDurations[NUM_LOGICAL_SWITCH];
@@ -1463,6 +1460,210 @@ void getSwitchesPosition(bool startup)
 
 int16_t csLastValue[NUM_LOGICAL_SWITCH];
 #define CS_LAST_VALUE_INIT -32768
+#if defined(CPUARM)
+uint32_t csState = {0};
+#else
+uint16_t csState = {0};
+#endif
+
+bool getCsState(int cs_idx)
+{
+  if (cs_idx<NUM_LOGICAL_SWITCH) {
+    return (csState & (1 << cs_idx));
+  }
+  return false;   //bug, if we come here
+}
+
+void setCsState(unsigned int cs_idx, bool state)
+{
+  if (cs_idx<NUM_LOGICAL_SWITCH) {
+    if (state) {
+      if (!getCsState(cs_idx)) PLAY_LOGICAL_SWITCH_ON(cs_idx);
+      csState |= (1 << cs_idx);  
+    }
+    else {
+      if (getCsState(cs_idx)) PLAY_LOGICAL_SWITCH_OFF(cs_idx);
+      csState &= ~(1 << cs_idx);  
+    }
+  }
+}
+
+
+/**
+  @brief Calculates new state of logical switches
+*/
+void evalCustomSwitches(void)
+{
+  for(unsigned int cs_idx=0; cs_idx<NUM_LOGICAL_SWITCH; cs_idx++) {
+
+    LogicalSwitchData * cs = cswAddress(cs_idx);
+#if defined(CPUARM)
+    int8_t s = cs->andsw;
+#else
+    uint8_t s = cs->andsw;
+    if (s > SWSRC_LAST_SWITCH) {
+      s += SWSRC_SW1-SWSRC_LAST_SWITCH-1;
+    }
+#endif
+    if (cs->func == LS_FUNC_NONE || (s && !getSwitch(s))) {
+      csLastValue[cs_idx] = CS_LAST_VALUE_INIT;
+      setCsState(cs_idx, false);
+    }
+    else if ((s=cswFamily(cs->func)) == LS_FAMILY_BOOL) {
+      bool res1 = getSwitch(cs->v1);
+      bool res2 = getSwitch(cs->v2);
+      switch (cs->func) {
+        case LS_FUNC_AND:
+          setCsState(cs_idx, (res1 && res2));
+          break;
+        case LS_FUNC_OR:
+          setCsState(cs_idx, (res1 || res2));
+          break;
+        // case LS_FUNC_XOR:
+        default:
+          setCsState(cs_idx, (res1 ^ res2));
+          break;
+      }
+    }
+    else if (s == LS_FAMILY_TIMER) {
+      setCsState(cs_idx, (csLastValue[cs_idx] <= 0));
+    }
+    else if (s == LS_FAMILY_STICKY) {
+      setCsState(cs_idx, (csLastValue[cs_idx] & (1<<0)));
+    }
+#if defined(CPUARM)
+    else if (s == LS_FAMILY_STAY) {
+      setCsState(cs_idx, (csLastValue[cs_idx] & (1<<0)));
+    }
+#endif
+    else {
+      getvalue_t x = getValue(cs->v1);
+      getvalue_t y;
+      if (s == LS_FAMILY_COMP) {
+        y = getValue(cs->v2);
+
+        switch (cs->func) {
+          case LS_FUNC_EQUAL:
+            setCsState(cs_idx, (x==y));
+            break;
+          case LS_FUNC_GREATER:
+            setCsState(cs_idx, (x>y));
+            break;
+          default:
+            setCsState(cs_idx, (x<y));
+            break;
+        }
+      }
+      else {
+        uint8_t v1 = cs->v1;
+#if defined(FRSKY)
+        // Telemetry
+        if (v1 >= MIXSRC_FIRST_TELEM) {
+          if ((!TELEMETRY_STREAMING() && v1 >= MIXSRC_FIRST_TELEM+TELEM_FIRST_STREAMED_VALUE-1) || IS_FAI_FORBIDDEN(v1-1)) {
+            //return swtch > 0 ? false : true;
+            setCsState(cs_idx, false);
+            continue;
+          }
+
+          y = convertCswTelemValue(cs);
+
+#if defined(FRSKY_HUB) && defined(GAUGES)
+          if (s == LS_FAMILY_OFS) {
+            uint8_t idx = v1-MIXSRC_FIRST_TELEM+1-TELEM_ALT;
+            if (idx < THLD_MAX) {
+              // Fill the threshold array
+              barsThresholds[idx] = 128 + cs->v2;
+            }
+          }
+#endif
+        }
+        else if (v1 >= MIXSRC_GVAR1) {
+          y = cs->v2;
+        }
+        else {
+          y = calc100toRESX(cs->v2);
+        }
+#else
+        if (v1 >= MIXSRC_FIRST_TELEM) {
+          y = (int16_t)3 * (128+cs->v2); // it's a Timer
+        }
+        else if (v1 >= MIXSRC_GVAR1) {
+          y = cs->v2; // it's a GVAR
+        }
+        else {
+          y = calc100toRESX(cs->v2);
+        }
+#endif
+
+        switch (cs->func) {
+#if defined(CPUARM)
+          case LS_FUNC_VEQUAL:
+            setCsState(cs_idx, (x==y));
+            break;
+#endif
+          case LS_FUNC_VALMOSTEQUAL:
+#if defined(GVARS)
+            if (v1 >= MIXSRC_GVAR1 && v1 <= MIXSRC_LAST_GVAR)
+              setCsState(cs_idx, (x==y));
+            else
+#endif
+              setCsState(cs_idx, (abs(x-y) < (1024 / STICK_TOLERANCE)));
+            break;
+          case LS_FUNC_VPOS:
+            setCsState(cs_idx, (x>y));
+            break;
+          case LS_FUNC_VNEG:
+            setCsState(cs_idx, (x<y));
+            break;
+          case LS_FUNC_APOS:
+            setCsState(cs_idx, (abs(x)>y));
+            break;
+          case LS_FUNC_ANEG:
+            setCsState(cs_idx, (abs(x)<y));
+            break;
+          default:
+          {
+            if (csLastValue[cs_idx] == CS_LAST_VALUE_INIT)
+              csLastValue[cs_idx] = x;
+            int16_t diff = x - csLastValue[cs_idx];
+            if (cs->func == LS_FUNC_DIFFEGREATER)
+              setCsState(cs_idx, (y >= 0 ? (diff >= y) : (diff <= y)));
+            else
+              setCsState(cs_idx, (abs(diff) >= y));
+            if (getCsState(cs_idx))
+              csLastValue[cs_idx] = x;
+            break;
+          }
+        }
+      }
+    }
+
+#if defined(CPUARM)
+    if (cs->delay) {
+      if (getCsState(cs_idx)) {
+        if (cswDelays[cs_idx] > get_tmr10ms())
+          setCsState(cs_idx, false);
+      }
+      else {
+        cswDelays[cs_idx] = get_tmr10ms() + (cs->delay*10);
+      }
+    }
+
+    if (cs->duration) {
+      if (getCsState(cs_idx) && !cswStates[cs_idx]) {
+        cswDurations[cs_idx] = get_tmr10ms() + (cs->duration*10);
+      }
+
+      cswStates[cs_idx] = getCsState(cs_idx);
+      setCsState(cs_idx, false);
+
+      if (cswDurations[cs_idx] > get_tmr10ms()) {
+        setCsState(cs_idx, true);
+      }
+    }
+#endif
+  }
+}
 
 /* recursive function. stack as of today (16/03/2012) grows by 8bytes at each call, which is ok! */
 bool getSwitch(int8_t swtch)
@@ -1522,189 +1723,8 @@ bool getSwitch(int8_t swtch)
 #endif
   else {
     cs_idx -= SWSRC_FIRST_LOGICAL_SWITCH;
-
-    GETSWITCH_RECURSIVE_TYPE mask = ((GETSWITCH_RECURSIVE_TYPE)1 << cs_idx);
-    if (s_last_switch_used & mask) {
-      result = (s_last_switch_value & mask);
-    }
-    else {
-      s_last_switch_used |= mask;
-
-      LogicalSwitchData * cs = cswAddress(cs_idx);
-#if defined(CPUARM)
-      int8_t s = cs->andsw;
-#else
-      uint8_t s = cs->andsw;
-      if (s > SWSRC_LAST_SWITCH) {
-        s += SWSRC_SW1-SWSRC_LAST_SWITCH-1;
-      }
-#endif
-      if (cs->func == LS_FUNC_NONE || (s && !getSwitch(s))) {
-        csLastValue[cs_idx] = CS_LAST_VALUE_INIT;
-        result = false;
-      }
-      else if ((s=cswFamily(cs->func)) == LS_FAMILY_BOOL) {
-        bool res1 = getSwitch(cs->v1);
-        bool res2 = getSwitch(cs->v2);
-        switch (cs->func) {
-          case LS_FUNC_AND:
-            result = (res1 && res2);
-            break;
-          case LS_FUNC_OR:
-            result = (res1 || res2);
-            break;
-          // case LS_FUNC_XOR:
-          default:
-            result = (res1 ^ res2);
-            break;
-        }
-      }
-      else if (s == LS_FAMILY_TIMER) {
-        result = (csLastValue[cs_idx] <= 0);
-      }
-      else if (s == LS_FAMILY_STICKY) {
-        result = (csLastValue[cs_idx] & (1<<0));
-      }
-#if defined(CPUARM)
-      else if (s == LS_FAMILY_STAY) {
-        result = (csLastValue[cs_idx] & (1<<0));
-      }
-#endif
-      else {
-        getvalue_t x = getValue(cs->v1);
-        getvalue_t y;
-        if (s == LS_FAMILY_COMP) {
-          y = getValue(cs->v2);
-
-          switch (cs->func) {
-            case LS_FUNC_EQUAL:
-              result = (x==y);
-              break;
-            case LS_FUNC_GREATER:
-              result = (x>y);
-              break;
-            default:
-              result = (x<y);
-              break;
-          }
-        }
-        else {
-          uint8_t v1 = cs->v1;
-#if defined(FRSKY)
-          // Telemetry
-          if (v1 >= MIXSRC_FIRST_TELEM) {
-            if ((!TELEMETRY_STREAMING() && v1 >= MIXSRC_FIRST_TELEM+TELEM_FIRST_STREAMED_VALUE-1) || IS_FAI_FORBIDDEN(v1-1))
-              return swtch > 0 ? false : true;
-
-            y = convertCswTelemValue(cs);
-
-#if defined(FRSKY_HUB) && defined(GAUGES)
-            if (s == LS_FAMILY_OFS) {
-              uint8_t idx = v1-MIXSRC_FIRST_TELEM+1-TELEM_ALT;
-              if (idx < THLD_MAX) {
-                // Fill the threshold array
-                barsThresholds[idx] = 128 + cs->v2;
-              }
-            }
-#endif
-          }
-          else if (v1 >= MIXSRC_GVAR1) {
-            y = cs->v2;
-          }
-          else {
-            y = calc100toRESX(cs->v2);
-          }
-#else
-          if (v1 >= MIXSRC_FIRST_TELEM) {
-            y = (int16_t)3 * (128+cs->v2); // it's a Timer
-          }
-          else if (v1 >= MIXSRC_GVAR1) {
-            y = cs->v2; // it's a GVAR
-          }
-          else {
-            y = calc100toRESX(cs->v2);
-          }
-#endif
-
-          switch (cs->func) {
-#if defined(CPUARM)
-            case LS_FUNC_VEQUAL:
-              result = (x==y);
-              break;
-#endif
-            case LS_FUNC_VALMOSTEQUAL:
-#if defined(GVARS)
-              if (v1 >= MIXSRC_GVAR1 && v1 <= MIXSRC_LAST_GVAR)
-                result = (x==y);
-              else
-#endif
-              result = (abs(x-y) < (1024 / STICK_TOLERANCE));
-              break;
-            case LS_FUNC_VPOS:
-              result = (x>y);
-              break;
-            case LS_FUNC_VNEG:
-              result = (x<y);
-              break;
-            case LS_FUNC_APOS:
-              result = (abs(x)>y);
-              break;
-            case LS_FUNC_ANEG:
-              result = (abs(x)<y);
-              break;
-            default:
-            {
-              if (csLastValue[cs_idx] == CS_LAST_VALUE_INIT)
-                csLastValue[cs_idx] = x;
-              int16_t diff = x - csLastValue[cs_idx];
-              if (cs->func == LS_FUNC_DIFFEGREATER)
-                result = (y >= 0 ? (diff >= y) : (diff <= y));
-              else
-                result = (abs(diff) >= y);
-              if (result)
-                csLastValue[cs_idx] = x;
-              break;
-            }
-          }
-        }
-      }
-
-#if defined(CPUARM)
-      if (cs->delay) {
-        if (result) {
-          if (cswDelays[cs_idx] > get_tmr10ms())
-            result = false;
-        }
-        else {
-          cswDelays[cs_idx] = get_tmr10ms() + (cs->delay*10);
-        }
-      }
-
-      if (cs->duration) {
-        if (result && !cswStates[cs_idx]) {
-          cswDurations[cs_idx] = get_tmr10ms() + (cs->duration*10);
-        }
-
-        cswStates[cs_idx] = result;
-        result = false;
-
-        if (cswDurations[cs_idx] > get_tmr10ms()) {
-          result = true;
-        }
-      }
-#endif
-
-      if (result) {
-        if (!(s_last_switch_value&mask)) PLAY_LOGICAL_SWITCH_ON(cs_idx);
-        s_last_switch_value |= mask;
-      }
-      else {
-        if (s_last_switch_value&mask) PLAY_LOGICAL_SWITCH_OFF(cs_idx);
-        s_last_switch_value &= ~mask;
-      }
-    }
+    result = getCsState(cs_idx);
   }
-
   return swtch > 0 ? result : !result;
 }
 
@@ -3049,7 +3069,8 @@ void resetAll()
     csLastValue[i] = CS_LAST_VALUE_INIT;
   }
 
-  s_last_switch_value = 0;
+  //s_last_switch_value = 0;
+  csState = 0;
   s_mixer_first_run_done = false;
 
   SKIP_AUTOMATIC_PROMPTS();
@@ -4146,6 +4167,8 @@ void doMixerCalculations()
 
   getSwitchesPosition(lastTMR == 0);
 
+  evalCustomSwitches();
+
 #if defined(CPUARM)
   lastTMR = tmr10ms;
 #endif
@@ -4167,8 +4190,6 @@ void doMixerCalculations()
   static uint16_t delta = 0;
   static ACTIVE_PHASES_TYPE s_fade_flight_phases = 0;
   static uint8_t s_last_phase = 255; // TODO reinit everything here when the model changes, no???
-
-  s_last_switch_used = 0;
 
   uint8_t phase = getFlightPhase();
 
@@ -4199,7 +4220,7 @@ void doMixerCalculations()
   if (s_fade_flight_phases) {
     memclear(sum_chans512, sizeof(sum_chans512));
     for (uint8_t p=0; p<MAX_FLIGHT_MODES; p++) {
-      s_last_switch_used = 0;
+      //s_last_switch_used = 0;
       if (s_fade_flight_phases & ((ACTIVE_PHASES_TYPE)1 << p)) {
         s_perout_flight_mode = p;
         perOut(p==phase ? e_perout_mode_normal : e_perout_mode_inactive_phase, p==phase ? tick10ms : 0);
@@ -4207,7 +4228,6 @@ void doMixerCalculations()
           sum_chans512[i] += (chans[i] >> 4) * fp_act[p];
         weight += fp_act[p];
       }
-      s_last_switch_used = 0;
     }
     assert(weight);
     s_perout_flight_mode = phase;

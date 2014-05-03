@@ -789,8 +789,6 @@ extern uint8_t trimsCheckTimer;
   #define GETSWITCH_RECURSIVE_TYPE uint16_t
 #endif
 
-extern volatile GETSWITCH_RECURSIVE_TYPE s_last_switch_used;
-extern volatile GETSWITCH_RECURSIVE_TYPE s_last_switch_value;
 extern int16_t csLastValue[NUM_LOGICAL_SWITCH];
 #define CS_LAST_VALUE_INIT -32768
 
